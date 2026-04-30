@@ -220,7 +220,14 @@ cmd_emit() {
     die "theme not found: $name" 1
   fi
   validate_file $file 0 || exit 2
+  # Wrap the theme body in an anonymous function so palette `local` vars run
+  # in their own scope. This shadows globals the user may have set (notably
+  # $fg / $bg from `autoload -U colors; colors`, which would otherwise cause
+  # "local: fg: inconsistent type for assignment"). `typeset -gA` inside the
+  # function still creates ZSH_HIGHLIGHT_STYLES at the global scope.
+  print -r -- '() {'
   cat -- $file
+  print -r -- '}'
   write_state $name
 }
 
