@@ -1,0 +1,352 @@
+#!/usr/bin/env zsh
+# hue — theme manager for zsh-syntax-highlighting
+
+emulate -L zsh
+setopt extended_glob
+
+readonly HUE_VERSION='0.1.0'
+
+typeset -g QUIET=0
+typeset -g NO_USER=0
+typeset -g THEMES_DIR_OVERRIDE=''
+typeset -ga POSITIONAL=()
+typeset -ga HUE_PATHS=()
+
+typeset -ga REQUIRED_KEYS=(
+  default unknown-token reserved-word
+  command builtin alias function hashed-command precommand
+  path path_pathseparator globbing
+  single-quoted-argument double-quoted-argument
+  dollar-quoted-argument dollar-double-quoted-argument back-quoted-argument
+  single-hyphen-option double-hyphen-option
+  commandseparator redirection assign history-expansion
+  comment
+  bracket-error bracket-level-1 bracket-level-2 bracket-level-3 bracket-level-4
+  cursor-matchingbracket
+)
+
+die() {
+  print -r -- "hue: $1" >&2
+  exit ${2:-1}
+}
+
+warn() {
+  (( QUIET )) && return
+  print -r -- "hue: $1" >&2
+}
+
+cmd_help() {
+  cat <<'EOF'
+Usage: hue <theme>                Print a theme as eval-able zsh code.
+       hue generate <theme>       Alias for the above.
+       hue list [--long]          List available themes.
+       hue path <theme>           Print the resolved theme file path.
+       hue current                Print the most recently applied theme.
+       hue check <theme>|--all    Validate theme(s) against required keys.
+       hue help                   Print usage.
+       hue version                Print version.
+
+Flags:
+  -q, --quiet            Suppress non-fatal warnings.
+      --no-user          Ignore ~/.config/hue/themes.
+      --themes-dir DIR   Override search path (colon-separated, like $PATH).
+
+Search order: $HUE_THEMES_DIR (or --themes-dir), ~/.config/hue/themes,
+              ~/.local/share/hue/themes, /usr/local/share/hue/themes.
+First match wins. `hue list` deduplicates by theme name across paths.
+
+Exit codes: 0 ok, 1 not found, 2 malformed, 64 usage error.
+EOF
+}
+
+cmd_version() {
+  print -r -- "hue $HUE_VERSION"
+}
+
+resolve_search_paths() {
+  HUE_PATHS=()
+  if [[ -n $THEMES_DIR_OVERRIDE ]]; then
+    HUE_PATHS=( ${(@s/:/)THEMES_DIR_OVERRIDE} )
+  elif [[ -n ${HUE_THEMES_DIR-} ]]; then
+    HUE_PATHS=( ${(@s/:/)HUE_THEMES_DIR} )
+  else
+    (( NO_USER )) || HUE_PATHS+=( $HOME/.config/hue/themes )
+    HUE_PATHS+=( $HOME/.local/share/hue/themes )
+    HUE_PATHS+=( /usr/local/share/hue/themes )
+    # When running from the repo (bin/hue with ../themes), include those.
+    local script_dir=${0:A:h}
+    [[ -d ${script_dir:h}/themes ]] && HUE_PATHS+=( ${script_dir:h}/themes )
+  fi
+}
+
+find_theme() {
+  local name=$1 p
+  resolve_search_paths
+  for p in $HUE_PATHS; do
+    [[ -n $p && -r $p/$name.zsh ]] && { print -r -- $p/$name.zsh; return 0 }
+  done
+  return 1
+}
+
+state_file() {
+  print -r -- "${XDG_STATE_HOME:-$HOME/.local/state}/hue/current"
+}
+
+write_state() {
+  local f=$(state_file)
+  if ! mkdir -p ${f:h} 2>/dev/null; then
+    warn "cannot create state directory: ${f:h}"
+    return
+  fi
+  if ! print -r -- $1 >| $f 2>/dev/null; then
+    warn "cannot write state file: $f"
+  fi
+}
+
+# parse_headers <file>  -> populates assoc-array META
+parse_headers() {
+  local file=$1
+  META=()
+  local line
+  while IFS= read -r line; do
+    if [[ $line =~ '^# hue:([a-z]+)[[:space:]]+(.+)$' ]]; then
+      META[${match[1]}]=${match[2]}
+    fi
+    [[ $line == typeset* ]] && break
+  done < $file
+}
+
+# validate_file <file> [strict]
+# Returns 0 ok, 2 malformed. strict=1 also enforces required keys.
+validate_file() {
+  local file=$1
+  local -i strict=${2:-0}
+
+  if [[ ! -r $file ]]; then
+    print -r -- "hue: $file: cannot read" >&2
+    return 2
+  fi
+
+  typeset -gA META
+  parse_headers $file
+
+  if [[ -z ${META[name]-} ]]; then
+    print -r -- "hue: $file: missing 'hue:name' header" >&2
+    return 2
+  fi
+  if [[ ${META[variant]-} != light && ${META[variant]-} != dark ]]; then
+    print -r -- "hue: $file: 'hue:variant' must be 'light' or 'dark'" >&2
+    return 2
+  fi
+
+  # Check exactly one typeset declaration line.
+  local -i typeset_count=0 saw_typeset=0
+  local -i depth=0
+  local line
+  while IFS= read -r line; do
+    if [[ $line == 'typeset -gA ZSH_HIGHLIGHT_STYLES=('* ]]; then
+      (( typeset_count++ ))
+    fi
+  done < $file
+  if (( typeset_count != 1 )); then
+    print -r -- "hue: $file: expected exactly one 'typeset -gA ZSH_HIGHLIGHT_STYLES=(' line, found $typeset_count" >&2
+    return 2
+  fi
+
+  # Walk lines: detect entry into the array, count parens, flag hostile content
+  # outside comments and the array body.
+  while IFS= read -r line; do
+    # Comments — skip.
+    if [[ $line == [[:space:]]#\#* ]]; then
+      continue
+    fi
+
+    if (( ! saw_typeset )); then
+      if [[ $line == 'typeset -gA ZSH_HIGHLIGHT_STYLES=('* ]]; then
+        saw_typeset=1
+        depth=1
+        local rest=${line#'typeset -gA ZSH_HIGHLIGHT_STYLES=('}
+        local opens=${#${rest//[^(]/}}
+        local closes=${#${rest//[^)]/}}
+        depth=$(( depth + opens - closes ))
+        continue
+      fi
+      # Outside the array — sanity check for hostile content.
+      if [[ $line == *'$('* || $line == *'`'* || $line == *'eval '* ]]; then
+        print -r -- "hue: $file: hostile content outside styles array: $line" >&2
+        return 2
+      fi
+    else
+      if (( depth > 0 )); then
+        local opens=${#${line//[^(]/}}
+        local closes=${#${line//[^)]/}}
+        depth=$(( depth + opens - closes ))
+        continue
+      fi
+      # After the array body — same sanity check.
+      if [[ $line == *'$('* || $line == *'`'* || $line == *'eval '* ]]; then
+        print -r -- "hue: $file: hostile content after styles array: $line" >&2
+        return 2
+      fi
+    fi
+  done < $file
+
+  if (( strict )); then
+    local -a missing=()
+    local key
+    local content
+    content=$(<$file)
+    for key in $REQUIRED_KEYS; do
+      # Match key as a standalone word at start of array entry: indented and
+      # followed by whitespace (then its value).
+      if ! print -r -- "$content" | grep -qE "^[[:space:]]+${key}[[:space:]]+['\"\$]"; then
+        missing+=( $key )
+      fi
+    done
+    if (( ${#missing} )); then
+      print -r -- "hue: $file: missing required keys: ${missing[*]}" >&2
+      return 2
+    fi
+  fi
+
+  return 0
+}
+
+cmd_emit() {
+  local name=${1-}
+  [[ -n $name ]] || die "usage: hue <theme>" 64
+  local file
+  if ! file=$(find_theme $name); then
+    die "theme not found: $name" 1
+  fi
+  validate_file $file 0 || exit 2
+  cat -- $file
+  write_state $name
+}
+
+cmd_list() {
+  local long=0
+  case ${1-} in
+    --long|-l) long=1 ;;
+    '') ;;
+    *) die "usage: hue list [--long]" 64 ;;
+  esac
+
+  resolve_search_paths
+  local -a seen=()
+  local p f name
+  for p in $HUE_PATHS; do
+    [[ -d $p ]] || continue
+    for f in $p/*.zsh(N); do
+      name=${f:t:r}
+      [[ ${seen[(Ie)$name]} -gt 0 ]] && continue
+      seen+=( $name )
+      if (( long )); then
+        typeset -gA META
+        parse_headers $f
+        printf '%-22s %-5s %s\n' $name ${META[variant]:-?} ${META[description]:-}
+      else
+        print -r -- $name
+      fi
+    done
+  done
+}
+
+cmd_path() {
+  local name=${1-}
+  [[ -n $name ]] || die "usage: hue path <theme>" 64
+  local file
+  if ! file=$(find_theme $name); then
+    die "theme not found: $name" 1
+  fi
+  print -r -- $file
+}
+
+cmd_current() {
+  local f=$(state_file)
+  if [[ ! -r $f ]]; then
+    die "no theme has been applied yet" 1
+  fi
+  cat -- $f
+}
+
+cmd_check() {
+  local arg=${1-}
+  if [[ $arg == --all ]]; then
+    resolve_search_paths
+    local -a seen=()
+    local -i failed=0
+    local p f name
+    for p in $HUE_PATHS; do
+      [[ -d $p ]] || continue
+      for f in $p/*.zsh(N); do
+        name=${f:t:r}
+        [[ ${seen[(Ie)$name]} -gt 0 ]] && continue
+        seen+=( $name )
+        if validate_file $f 1 2>/tmp/hue-check.$$; then
+          print -r -- "ok    $name"
+        else
+          print -r -- "FAIL  $name"
+          (( QUIET )) || cat /tmp/hue-check.$$ >&2
+          (( failed++ ))
+        fi
+      done
+    done
+    rm -f /tmp/hue-check.$$
+    return $(( failed ? 2 : 0 ))
+  elif [[ -n $arg ]]; then
+    local file
+    if ! file=$(find_theme $arg); then
+      die "theme not found: $arg" 1
+    fi
+    if validate_file $file 1; then
+      print -r -- "ok    $arg"
+      return 0
+    fi
+    return 2
+  else
+    die "usage: hue check <theme>|--all" 64
+  fi
+}
+
+parse_args() {
+  POSITIONAL=()
+  while (( $# )); do
+    case $1 in
+      -q|--quiet) QUIET=1 ;;
+      --no-user) NO_USER=1 ;;
+      --themes-dir)
+        (( $# >= 2 )) || die "--themes-dir requires an argument" 64
+        THEMES_DIR_OVERRIDE=$2
+        shift
+        ;;
+      --themes-dir=*) THEMES_DIR_OVERRIDE=${1#--themes-dir=} ;;
+      -h|--help) cmd_help; exit 0 ;;
+      -V|--version) cmd_version; exit 0 ;;
+      --) shift; POSITIONAL+=( "$@" ); break ;;
+      -*) die "unknown flag: $1" 64 ;;
+      *) POSITIONAL+=( $1 ) ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  parse_args "$@"
+  local cmd=${POSITIONAL[1]:-help}
+  local -a rest
+  (( ${#POSITIONAL} > 1 )) && rest=( ${POSITIONAL[2,-1]} )
+
+  case $cmd in
+    help)     cmd_help ;;
+    version)  cmd_version ;;
+    list)     cmd_list "${rest[@]}" ;;
+    path)     cmd_path "${rest[@]}" ;;
+    current)  cmd_current ;;
+    check)    cmd_check "${rest[@]}" ;;
+    generate) cmd_emit "${rest[@]}" ;;
+    *)        cmd_emit $cmd ;;
+  esac
+}
+
+main "$@"
