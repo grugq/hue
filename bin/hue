@@ -199,7 +199,7 @@ validate_file() {
     for key in $REQUIRED_KEYS; do
       # Match key as a standalone word at start of array entry: indented and
       # followed by whitespace (then its value).
-      if ! print -r -- "$content" | grep -qE "^[[:space:]]+${key}[[:space:]]+['\"\$]"; then
+      if ! print -r -- "$content" | grep -qE "^[[:space:]]+${key}[[:space:]]"; then
         missing+=( $key )
       fi
     done
@@ -311,7 +311,13 @@ cmd_check() {
 
 parse_args() {
   POSITIONAL=()
+  local -i seen_cmd=0
   while (( $# )); do
+    if (( seen_cmd )); then
+      POSITIONAL+=( $1 )
+      shift
+      continue
+    fi
     case $1 in
       -q|--quiet) QUIET=1 ;;
       --no-user) NO_USER=1 ;;
@@ -325,7 +331,7 @@ parse_args() {
       -V|--version) cmd_version; exit 0 ;;
       --) shift; POSITIONAL+=( "$@" ); break ;;
       -*) die "unknown flag: $1" 64 ;;
-      *) POSITIONAL+=( $1 ) ;;
+      *) POSITIONAL+=( $1 ); seen_cmd=1 ;;
     esac
     shift
   done
