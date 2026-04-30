@@ -51,8 +51,12 @@ Add this function to your zshrc:
 
     hue-set() {
       eval "$(hue ${1:?usage: hue-set <theme>})" || return
-      # repaint current line so the new colours apply immediately
+      # repaint the current line if we're inside a ZLE widget — when called
+      # from the prompt directly, this is a no-op and the new colours apply
+      # to the next command. The trailing `:` keeps the function's exit
+      # status at 0 (zle outside a widget returns 1).
       zle && zle .reset-prompt
+      :
     }
 
 Then `hue-set gruvbox-dark` works live.
@@ -69,6 +73,7 @@ Then `hue-set gruvbox-dark` works live.
       fi
       eval "$(hue $theme)"
       zle && zle .reset-prompt
+      :
     }
     hue-auto
 
