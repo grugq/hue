@@ -15,12 +15,16 @@ Themes are data files (zsh associative-array literals), not code. Adding a theme
 
 ### Manual
 
-    git clone https://github.com/USER/hue ~/src/hue
+    git clone https://github.com/grugq/hue ~/src/hue
     install -m 0755 ~/src/hue/bin/hue ~/.local/bin/hue
     mkdir -p ~/.local/share/hue
     cp -r ~/src/hue/themes ~/.local/share/hue/
+    install -m 0644 ~/src/hue/completions/_hue ~/.local/share/zsh/site-functions/_hue
 
-Make sure `~/.local/bin` is on your `$PATH`.
+Make sure `~/.local/bin` is on your `$PATH`. To enable tab completion, add the completion directory to `$fpath` **before** `compinit` runs:
+
+    fpath=(~/.local/share/zsh/site-functions $fpath)
+    autoload -U compinit && compinit
 
 ### Or run the installer
 
